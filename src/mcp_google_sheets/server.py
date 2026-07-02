@@ -5,12 +5,14 @@ A Model Context Protocol (MCP) server built with FastMCP for interacting with Go
 """
 
 import base64
+import contextvars
+import functools
 import logging
 import os
 import sys
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Tuple, Union
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
@@ -35,6 +37,25 @@ TOKEN_PATH = os.environ.get('TOKEN_PATH', 'token.json')
 CREDENTIALS_PATH = os.environ.get('CREDENTIALS_PATH', 'credentials.json')
 SERVICE_ACCOUNT_PATH = os.environ.get('SERVICE_ACCOUNT_PATH', 'service_account.json')
 DRIVE_FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID', '')  # Working directory in Google Drive
+
+# Domain-Wide Delegation: base64-encoded service account key (distinct from
+# CREDENTIALS_CONFIG above, which upstream uses as a *bare*, non-impersonating
+# service account). When set, every tool call impersonates the acting user
+# supplied via the request's _meta.actingUserEmail instead of using a single
+# shared identity. See _get_impersonated_services() and the tool() wrapper below.
+DWD_SERVICE_ACCOUNT_CONFIG = os.environ.get('DWD_SERVICE_ACCOUNT_CONFIG')
+
+# Request-scoped (not session-scoped) storage for the current tool call's
+# impersonated services. A plain attribute on the shared SpreadsheetContext
+# would race under concurrent calls from different users sharing one lifespan
+# (the gateway's /mcp bridge funnels all users through a single upstream MCP
+# session). ContextVars are isolated per asyncio Task, and FastMCP invokes
+# each sync tool function directly on the task handling that request (no
+# thread pool involved — see mcp.server.fastmcp.utilities.func_metadata
+# .call_fn_with_arg_validation), so this is safe without locking.
+_impersonated_services_var: "contextvars.ContextVar[Optional[Tuple[Any, Any]]]" = contextvars.ContextVar(
+    "_impersonated_services", default=None
+)
 
 
 def _configure_logging() -> None:
@@ -76,14 +97,87 @@ ENABLED_TOOLS = _parse_enabled_tools()
 @dataclass
 class SpreadsheetContext:
     """Context for Google Spreadsheet service"""
-    sheets_service: Any
-    drive_service: Any
+    _sheets_service: Any = None
+    _drive_service: Any = None
     folder_id: Optional[str] = None
+    dwd_credentials: Optional[Any] = None
+    _impersonated_cache: Dict[str, Tuple[Any, Any]] = field(default_factory=dict)
+
+    @property
+    def sheets_service(self) -> Any:
+        override = _impersonated_services_var.get()
+        if override is not None:
+            return override[0]
+        if self.dwd_credentials is not None:
+            raise RuntimeError(
+                "Domain-Wide Delegation is configured but no acting-user email was in "
+                "scope for this call. This happens if a code path bypasses the tool() "
+                "wrapper below (e.g. an MCP resource, not a tool) — DWD mode has no "
+                "default/shared identity to fall back to."
+            )
+        return self._sheets_service
+
+    @property
+    def drive_service(self) -> Any:
+        override = _impersonated_services_var.get()
+        if override is not None:
+            return override[1]
+        if self.dwd_credentials is not None:
+            raise RuntimeError(
+                "Domain-Wide Delegation is configured but no acting-user email was in "
+                "scope for this call. This happens if a code path bypasses the tool() "
+                "wrapper below (e.g. an MCP resource, not a tool) — DWD mode has no "
+                "default/shared identity to fall back to."
+            )
+        return self._drive_service
+
+
+def _get_impersonated_services(lifespan_ctx: SpreadsheetContext, email: str) -> Tuple[Any, Any]:
+    """Return (sheets_service, drive_service) impersonating `email`, building and
+    caching them on first use per acting user. Constructing impersonated
+    credentials via with_subject() is a local, synchronous operation — no
+    network call happens until the first actual Sheets/Drive API request, and
+    that JWT-bearer exchange is the fast, deterministic kind (unlike the OAuth
+    user-token refresh dance this replaces)."""
+    cached = lifespan_ctx._impersonated_cache.get(email)
+    if cached is not None:
+        return cached
+
+    impersonated_creds = lifespan_ctx.dwd_credentials.with_subject(email)
+    sheets_service = build('sheets', 'v4', credentials=impersonated_creds, cache_discovery=False)
+    drive_service = build('drive', 'v3', credentials=impersonated_creds, cache_discovery=False)
+
+    services = (sheets_service, drive_service)
+    lifespan_ctx._impersonated_cache[email] = services
+    return services
 
 
 @asynccontextmanager
 async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetContext]:
     """Manage Google Spreadsheet API connection lifecycle"""
+
+    # Domain-Wide Delegation mode: load the DWD service account's key once
+    # (a local, synchronous operation — no network call, no per-session
+    # refresh dance) and defer building any actual sheets/drive service until
+    # a tool call arrives with an acting user to impersonate. Skips the
+    # OAuth/ADC/bare-service-account resolution below entirely.
+    if DWD_SERVICE_ACCOUNT_CONFIG:
+        dwd_credentials = service_account.Credentials.from_service_account_info(
+            json.loads(base64.b64decode(DWD_SERVICE_ACCOUNT_CONFIG)), scopes=SCOPES
+        )
+        logger.info(
+            "Using Domain-Wide Delegation service account — credentials will be "
+            "impersonated per acting user on each tool call"
+        )
+        try:
+            yield SpreadsheetContext(
+                folder_id=DRIVE_FOLDER_ID if DRIVE_FOLDER_ID else None,
+                dwd_credentials=dwd_credentials,
+            )
+        finally:
+            pass
+        return
+
     # Authenticate and build the service
     creds = None
 
@@ -161,8 +255,8 @@ async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetCont
     try:
         # Provide the service in the context
         yield SpreadsheetContext(
-            sheets_service=sheets_service,
-            drive_service=drive_service,
+            _sheets_service=sheets_service,
+            _drive_service=drive_service,
             folder_id=DRIVE_FOLDER_ID if DRIVE_FOLDER_ID else None
         )
     finally:
@@ -203,19 +297,67 @@ def tool(annotations: Optional[ToolAnnotations] = None):
     """
     def decorator(func):
         tool_name = func.__name__
-        
+
         # If no filtering is configured, or if this tool is in the enabled list
         if ENABLED_TOOLS is None or tool_name in ENABLED_TOOLS:
+            wrapped = _with_impersonation(func)
             # Apply the mcp.tool decorator
             if annotations:
-                return mcp.tool(annotations=annotations)(func)
+                return mcp.tool(annotations=annotations)(wrapped)
             else:
-                return mcp.tool()(func)
+                return mcp.tool()(wrapped)
         else:
             # Don't register this tool - return the function undecorated
             return func
-    
+
     return decorator
+
+
+def _with_impersonation(func):
+    """Wrap a tool function so that, in Domain-Wide Delegation mode, it runs
+    with sheets_service/drive_service impersonating the acting user for the
+    duration of this call.
+
+    functools.wraps preserves func's signature (inspect.signature follows
+    __wrapped__), which FastMCP's schema generation and ctx-parameter
+    detection both depend on — verified against mcp.server.fastmcp.utilities
+    .func_metadata, which calls inspect.signature(fn, eval_str=True).
+
+    Tool bodies are unchanged: they keep reading
+    ctx.request_context.lifespan_context.sheets_service/drive_service as
+    before. Those are now properties (see SpreadsheetContext) that resolve
+    to this call's impersonated services via the contextvar set here.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        ctx = kwargs.get('ctx')
+        lifespan_ctx = ctx.request_context.lifespan_context if ctx is not None else None
+
+        # getattr (not direct access): unit tests and any future caller are free to pass
+        # a lightweight duck-typed lifespan_context (e.g. SimpleNamespace) that predates
+        # DWD support and has no dwd_credentials attribute at all.
+        if lifespan_ctx is None or getattr(lifespan_ctx, 'dwd_credentials', None) is None:
+            # Not in DWD mode (or no ctx, e.g. direct unit-test call) — unchanged behavior.
+            return func(*args, **kwargs)
+
+        meta = ctx.request_context.meta
+        acting_email = getattr(meta, 'actingUserEmail', None) if meta is not None else None
+        if not acting_email:
+            raise ValueError(
+                "Domain-Wide Delegation is configured but this request's _meta had no "
+                "actingUserEmail — refusing to guess which user's identity to impersonate. "
+                "The gateway must inject _meta.actingUserEmail on every tools/call request."
+            )
+
+        services = _get_impersonated_services(lifespan_ctx, acting_email)
+        token = _impersonated_services_var.set(services)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _impersonated_services_var.reset(token)
+
+    return wrapper
 
 
 @tool(

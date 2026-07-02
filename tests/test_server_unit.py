@@ -5,7 +5,7 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from mcp_google_sheets import server
 
@@ -517,6 +517,109 @@ class ToolRequestConstructionTests(unittest.TestCase):
                 "heightPixels": 200,
             },
         )
+
+
+def fake_dwd_ctx(dwd_credentials, acting_user_email=None):
+    """A ctx wired to a real SpreadsheetContext in DWD mode, mirroring what the
+    forked spreadsheet_lifespan() yields when DWD_SERVICE_ACCOUNT_CONFIG is set."""
+    lifespan_context = server.SpreadsheetContext(dwd_credentials=dwd_credentials)
+    meta = SimpleNamespace(actingUserEmail=acting_user_email) if acting_user_email is not None else None
+    request_context = SimpleNamespace(lifespan_context=lifespan_context, meta=meta)
+    return SimpleNamespace(request_context=request_context)
+
+
+def fake_build_factory(drive_files_result=None):
+    """Stand-in for googleapiclient.discovery.build() that returns MagicMocks
+    wired up just enough for list_spreadsheets/list_folders to run for real."""
+    drive_files_result = drive_files_result if drive_files_result is not None else {"files": []}
+
+    def fake_build(api, version, credentials, cache_discovery=False):
+        service = MagicMock(name=f"{api}-{version}-service")
+        service.files.return_value.list.return_value.execute.return_value = drive_files_result
+        return service
+
+    return fake_build
+
+
+class DomainWideDelegationImpersonationTests(unittest.TestCase):
+    """Proves the _meta.actingUserEmail -> per-call impersonated credentials
+    wiring works end to end, without needing a real DWD-granted service
+    account. This is the local validation for the gateway's _meta injection
+    contract: the gateway must set _meta.actingUserEmail on every tools/call
+    request when DWD is configured, matching what these tests assert on."""
+
+    def test_tool_call_impersonates_the_acting_user_from_meta(self):
+        dwd_credentials = MagicMock(name="dwd_base_credentials")
+        dwd_credentials.with_subject.return_value = MagicMock(name="impersonated_creds")
+        ctx = fake_dwd_ctx(dwd_credentials, acting_user_email="fernanda@privadoadvisors.com")
+
+        with patch.object(server, "build", side_effect=fake_build_factory()):
+            result = server.list_spreadsheets(ctx=ctx)
+
+        self.assertEqual(result, [])
+        dwd_credentials.with_subject.assert_called_once_with("fernanda@privadoadvisors.com")
+
+    def test_same_acting_user_reuses_cached_services_across_tool_calls(self):
+        dwd_credentials = MagicMock(name="dwd_base_credentials")
+        dwd_credentials.with_subject.return_value = MagicMock(name="impersonated_creds")
+        ctx = fake_dwd_ctx(dwd_credentials, acting_user_email="madison@privadoadvisors.com")
+
+        with patch.object(server, "build", side_effect=fake_build_factory()) as build:
+            server.list_spreadsheets(ctx=ctx)
+            server.list_folders(ctx=ctx)
+
+        # Two different tools, same acting user, same lifespan_context: one
+        # impersonation, one pair of (sheets, drive) service builds — not four.
+        dwd_credentials.with_subject.assert_called_once_with("madison@privadoadvisors.com")
+        self.assertEqual(build.call_count, 2)  # sheets + drive, built once and cached
+
+    def test_different_acting_users_get_isolated_credentials(self):
+        dwd_credentials = MagicMock(name="dwd_base_credentials")
+        dwd_credentials.with_subject.side_effect = lambda email: MagicMock(name=f"creds-{email}")
+        ctx_a = fake_dwd_ctx(dwd_credentials, acting_user_email="robert@privadoadvisors.com")
+        ctx_b = fake_dwd_ctx(dwd_credentials, acting_user_email="fernanda@privadoadvisors.com")
+        # Same underlying lifespan_context (as if both requests hit the one shared
+        # /mcp bridge session) — only the acting user differs, as it would per-call.
+        ctx_b.request_context.lifespan_context = ctx_a.request_context.lifespan_context
+
+        with patch.object(server, "build", side_effect=fake_build_factory()):
+            server.list_spreadsheets(ctx=ctx_a)
+            server.list_spreadsheets(ctx=ctx_b)
+
+        self.assertEqual(
+            dwd_credentials.with_subject.call_args_list,
+            [unittest.mock.call("robert@privadoadvisors.com"), unittest.mock.call("fernanda@privadoadvisors.com")],
+        )
+
+    def test_missing_acting_user_email_raises_instead_of_guessing(self):
+        dwd_credentials = MagicMock(name="dwd_base_credentials")
+        ctx = fake_dwd_ctx(dwd_credentials, acting_user_email=None)
+
+        with self.assertRaises(ValueError):
+            server.list_spreadsheets(ctx=ctx)
+
+        dwd_credentials.with_subject.assert_not_called()
+
+    def test_contextvar_override_does_not_leak_across_calls(self):
+        dwd_credentials = MagicMock(name="dwd_base_credentials")
+        dwd_credentials.with_subject.return_value = MagicMock(name="impersonated_creds")
+        ctx = fake_dwd_ctx(dwd_credentials, acting_user_email="robert@privadoadvisors.com")
+
+        with patch.object(server, "build", side_effect=fake_build_factory()):
+            server.list_spreadsheets(ctx=ctx)
+
+        # After the call returns, the contextvar must be reset — accessing the
+        # properties directly (as a bypassing code path, e.g. a resource, would)
+        # must hit the "no acting user in scope" guard, not a stale override.
+        self.assertIsNone(server._impersonated_services_var.get())
+        with self.assertRaises(RuntimeError):
+            _ = ctx.request_context.lifespan_context.sheets_service
+
+    def test_non_dwd_mode_is_unaffected(self):
+        sheets_service = RecordingSheetsService()
+        lifespan_context = server.SpreadsheetContext(_sheets_service=sheets_service, _drive_service=None)
+        self.assertIsNone(lifespan_context.dwd_credentials)
+        self.assertIs(lifespan_context.sheets_service, sheets_service)
 
 
 if __name__ == "__main__":
