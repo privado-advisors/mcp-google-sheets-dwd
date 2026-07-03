@@ -1153,9 +1153,19 @@ def list_spreadsheets(folder_id: Optional[str] = None, ctx: Context = None) -> L
         logger.info("Searching for spreadsheets in 'My Drive'")
     
     # List spreadsheets
+    #
+    # corpora='allDrives' matters here, not just includeItemsFromAllDrives/
+    # supportsAllDrives: without an explicit driveId, files.list() defaults to
+    # corpora='user' (My Drive + items individually shared with the caller),
+    # which does NOT reliably include items visible only via Shared Drive
+    # membership, even with those two flags set. Confirmed empirically: a
+    # known Shared Drive spreadsheet was invisible to two staff accounts and
+    # only showed up for a third whose access happened to also include a
+    # direct individual share of that file.
     results = drive_service.files().list(
         q=query,
         spaces='drive',
+        corpora='allDrives',
         includeItemsFromAllDrives=True,
         supportsAllDrives=True,
         fields='files(id, name)',
@@ -1223,10 +1233,14 @@ def share_spreadsheet(spreadsheet_id: str,
         }
         
         try:
+            # supportsAllDrives=True is required here, not just on files().list()
+            # calls elsewhere in this file — permissions().create() on a file that
+            # lives in a Shared Drive fails without it. Upstream didn't set this.
             result = drive_service.permissions().create(
                 fileId=spreadsheet_id,
                 body=permission,
                 sendNotificationEmail=send_notification,
+                supportsAllDrives=True,
                 fields='id'
             ).execute()
             successes.append({
@@ -1279,13 +1293,21 @@ def list_folders(parent_folder_id: Optional[str] = None, ctx: Context = None) ->
         logger.info("Searching for folders in parent folder: %s", parent_folder_id)
     else:
         # Search in root of My Drive (folders that don't have any parent folders)
+        #
+        # Known limitation, not fixed by corpora/includeItemsFromAllDrives below:
+        # a Shared Drive's own root is not 'root' in this sense, so calling this
+        # tool with no parent_folder_id will never surface Shared Drive top-level
+        # folders — only folders inside a Shared Drive once its folder ID is
+        # already known (i.e. passed explicitly as parent_folder_id) are reachable.
         query += " and 'root' in parents"
         logger.info("Searching for folders in 'My Drive' root")
-    
+
     # List folders
+    # See the corpora comment in list_spreadsheets() above — same fix applies here.
     results = drive_service.files().list(
         q=query,
         spaces='drive',
+        corpora='allDrives',
         includeItemsFromAllDrives=True,
         supportsAllDrives=True,
         fields='files(id, name, parents)',
@@ -1339,10 +1361,12 @@ def search_spreadsheets(query: str,
     )
 
     try:
+        # See the corpora comment in list_spreadsheets() above — same fix applies here.
         results = drive_service.files().list(
             q=search_query,
             pageSize=max_results,
             spaces='drive',
+            corpora='allDrives',
             includeItemsFromAllDrives=True,
             supportsAllDrives=True,
             fields='files(id, name, createdTime, modifiedTime, owners, webViewLink)',
